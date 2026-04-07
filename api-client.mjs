@@ -9,7 +9,7 @@
  *   node api-client.mjs
  *
  * 环境变量:
- *   BRIDGE_URL      - Bridge WebSocket 地址 (默认: wss://account-admin-36mzln.camelai.app/connect)
+ *   BRIDGE_URL      - Bridge WebSocket 地址（默认从 APP_PUBLISH_ADDRESS 拼接 /connect）
  *   BRIDGE_TOKEN    - Bridge 连接 token
  *   BRIDGE_ID       - 客户端标识 (默认: local-1)
  *   ANTHROPIC_BASE_URL - Anthropic API 地址

@@ -89,6 +89,8 @@ export class WebSocketBridge {
 
       const body = await request.text();
       const requestId = crypto.randomUUID();
+      const path = url.pathname;     // e.g. "/v1/messages", "/v1/chat/completions"
+      const method = request.method; // "GET" or "POST"
 
       // 检测是否为流式请求
       let isStream = false;
@@ -112,8 +114,8 @@ export class WebSocketBridge {
         this.streamWriters.set(requestId, { writer, timer, sourceWs: targetWs });
 
         // 发送给目标下游
-        this.addLog("send", "stream_request", requestId, "Stream request to downstream", body);
-        targetWs.send(JSON.stringify({ requestId, body, stream: true }));
+        this.addLog("send", "stream_request", requestId, `Stream ${method} ${path} to downstream`, body);
+        targetWs.send(JSON.stringify({ requestId, path, method, body, stream: true }));
 
         return new Response(readable, {
           headers: {
@@ -132,9 +134,9 @@ export class WebSocketBridge {
 
           this.pending.set(requestId, { resolve, reject, timer });
 
-          this.addLog("send", "request", requestId, "Request to downstream", body);
+          this.addLog("send", "request", requestId, `${method} ${path} to downstream`, body);
           for (const { ws } of activeSessions) {
-            ws.send(JSON.stringify({ requestId, body, stream: false }));
+            ws.send(JSON.stringify({ requestId, path, method, body, stream: false }));
           }
         });
 

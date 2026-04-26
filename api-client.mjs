@@ -14,6 +14,8 @@
  *   BRIDGE_ID       - 客户端标识 (默认: local-1)
  *   ANTHROPIC_BASE_URL - Anthropic API 地址
  *   ANTHROPIC_API_KEY  - Anthropic API Key
+ *   OPENAI_BASE_URL    - OpenAI 兼容 API 地址（降级备选）
+ *   OPENAI_API_KEY     - OpenAI 兼容 API Key（降级备选）
  *   HEARTBEAT_INTERVAL - 心跳间隔ms (默认: 25000)
  *   RECONNECT_MAX_DELAY - 最大重连延迟ms (默认: 30000)
  */
@@ -55,12 +57,16 @@ const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || "sk-7b6b0KtHVbDloF7RbKIjzmvSYhK
 const BRIDGE_ID = process.env.BRIDGE_ID || "local-1";
 const ANTHROPIC_BASE_URL = process.env.ANTHROPIC_BASE_URL;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const HEARTBEAT_INTERVAL = Number(process.env.HEARTBEAT_INTERVAL) || 25000;
 const RECONNECT_MAX_DELAY = Number(process.env.RECONNECT_MAX_DELAY) || 30000;
 
 if (!ANTHROPIC_BASE_URL || !ANTHROPIC_API_KEY) {
-  console.error("必须设置 ANTHROPIC_BASE_URL 和 ANTHROPIC_API_KEY");
-  process.exit(1);
+  if (!OPENAI_BASE_URL || !OPENAI_API_KEY) {
+    console.error("必须设置 ANTHROPIC_BASE_URL+ANTHROPIC_API_KEY 或 OPENAI_BASE_URL+OPENAI_API_KEY（至少一组）");
+    process.exit(1);
+  }
 }
 
 let ws = null;
@@ -120,25 +126,52 @@ function connect() {
       return;
     }
 
-    if (!msg.requestId || !msg.body) {
+    if (!msg.requestId) {
       return;
     }
 
     const rid = msg.requestId.slice(0, 8);
+    const path = msg.path || "/v1/messages";
+    const method = msg.method || "POST";
     const isStream = msg.stream === true;
 
-    log(`收到请求 ${rid}... (stream=${isStream})`);
+    log(`收到请求 ${rid}... ${method} ${path} (stream=${isStream})`);
 
     // 为这个请求创建 AbortController
     const controller = new AbortController();
     activeControllers.set(msg.requestId, controller);
 
     try {
-      if (isStream) {
-        await forwardToAnthropicStream(msg.requestId, msg.body, controller);
-      } else {
-        const response = await forwardToAnthropic(msg.body, controller);
+      if (path === "/v1/messages") {
+        // Anthropic Messages: 先 Anthropic 后降级 OpenAI（含格式转换）
+        if (isStream) {
+          await forwardStreamWithFallback(msg.requestId, msg.body, controller);
+        } else {
+          const response = await forwardWithFallback(msg.body, controller);
+          safeSend({ requestId: msg.requestId, response });
+        }
+      } else if (path === "/v1/models") {
+        // 透传到 OpenAI /v1/models
+        const response = await forwardToOpenAIPassthrough("/v1/models", "GET", null, controller);
         safeSend({ requestId: msg.requestId, response });
+      } else if (path === "/v1/chat/completions") {
+        // 直接透传到 OpenAI /v1/chat/completions
+        if (isStream) {
+          await forwardToOpenAIPassthroughStream(msg.requestId, "/v1/chat/completions", msg.body, controller);
+        } else {
+          const response = await forwardToOpenAIPassthrough("/v1/chat/completions", "POST", msg.body, controller);
+          safeSend({ requestId: msg.requestId, response });
+        }
+      } else if (path === "/v1/responses") {
+        // 直接透传到 OpenAI /v1/responses
+        if (isStream) {
+          await forwardToOpenAIPassthroughStream(msg.requestId, "/v1/responses", msg.body, controller);
+        } else {
+          const response = await forwardToOpenAIPassthrough("/v1/responses", "POST", msg.body, controller);
+          safeSend({ requestId: msg.requestId, response });
+        }
+      } else {
+        throw new Error(`未知的路径: ${path}`);
       }
       log(`请求 ${rid}... 处理完成`);
     } catch (err) {
@@ -277,6 +310,372 @@ async function forwardToAnthropicStream(requestId, body, controller) {
   }
 }
 
+// ── Anthropic Messages ↔ OpenAI Chat 格式转换 ──────────────────────────
+
+/** Anthropic messages 请求 → OpenAI chat completions 请求 */
+function anthropicToOpenAIRequest(parsed) {
+  const messages = [];
+
+  // system → OpenAI system message
+  if (parsed.system) {
+    const systemText = Array.isArray(parsed.system)
+      ? parsed.system
+          .filter((b) => b.type === "text")
+          .map((b) => b.text)
+          .join("\n")
+      : parsed.system;
+    if (systemText) {
+      messages.push({ role: "system", content: systemText });
+    }
+  }
+
+  // messages 转换
+  for (const msg of parsed.messages || []) {
+    if (typeof msg.content === "string") {
+      messages.push({ role: msg.role, content: msg.content });
+    } else if (Array.isArray(msg.content)) {
+      // content blocks → 提取文本（图片等暂不支持）
+      const text = msg.content
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("\n");
+      if (text) {
+        messages.push({ role: msg.role, content: text });
+      }
+    }
+  }
+
+  const result = {
+    model: parsed.model || "gpt-4o",
+    messages,
+    stream: parsed.stream ?? false,
+  };
+
+  if (parsed.max_tokens) result.max_tokens = parsed.max_tokens;
+  if (parsed.temperature != null) result.temperature = parsed.temperature;
+  if (parsed.top_p != null) result.top_p = parsed.top_p;
+  if (parsed.stop_sequences) result.stop = parsed.stop_sequences;
+
+  return result;
+}
+
+/** OpenAI chat completions 非流式响应 → Anthropic messages 响应 */
+function openAIToAnthropicResponse(data) {
+  const choice = data.choices?.[0];
+  const content = [];
+
+  if (choice?.message?.content) {
+    content.push({ type: "text", text: choice.message.content });
+  }
+
+  return {
+    id: data.id || `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+    type: "message",
+    role: "assistant",
+    content,
+    model: data.model || "unknown",
+    stop_reason: choice?.finish_reason === "stop" ? "end_turn"
+      : choice?.finish_reason === "length" ? "max_tokens"
+      : "end_turn",
+    stop_sequence: null,
+    usage: {
+      input_tokens: data.usage?.prompt_tokens || 0,
+      output_tokens: data.usage?.completion_tokens || 0,
+    },
+  };
+}
+
+/** 非流式转发 → OpenAI（降级） */
+async function forwardToOpenAI(body, controller) {
+  let parsed = typeof body === "string" ? JSON.parse(body) : body;
+  const openAIBody = anthropicToOpenAIRequest({ ...parsed, stream: false });
+  const apiUrl = `${OPENAI_BASE_URL}/v1/chat/completions`;
+
+  const timeout = setTimeout(() => controller.abort(), 120000);
+  try {
+    const res = await fetch(apiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify(openAIBody),
+      signal: controller.signal,
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(`OpenAI API ${res.status}: ${JSON.stringify(data)}`);
+    }
+    return openAIToAnthropicResponse(data);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** 流式转发 → OpenAI（降级），将 OpenAI SSE 转为 Anthropic SSE 格式 */
+async function forwardToOpenAIStream(requestId, body, controller) {
+  let parsed = typeof body === "string" ? JSON.parse(body) : body;
+  const openAIBody = anthropicToOpenAIRequest({ ...parsed, stream: true });
+  // 请求 stream_options 以获取 usage
+  openAIBody.stream_options = { include_usage: true };
+  const apiUrl = `${OPENAI_BASE_URL}/v1/chat/completions`;
+
+  const timeout = setTimeout(() => controller.abort(), 300000);
+  try {
+    const res = await fetch(apiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify(openAIBody),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const errorText = await res.text();
+      throw new Error(`OpenAI API ${res.status}: ${errorText}`);
+    }
+
+    const msgId = `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+    const model = parsed.model || "unknown";
+
+    // 发送 Anthropic 格式的 message_start
+    const startEvent =
+      `event: message_start\n` +
+      `data: ${JSON.stringify({
+        type: "message_start",
+        message: {
+          id: msgId, type: "message", role: "assistant",
+          content: [], model, stop_reason: null, stop_sequence: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      })}\n\n`;
+    safeSend({ requestId, type: "stream_chunk", chunk: startEvent });
+
+    // content_block_start
+    const blockStart =
+      `event: content_block_start\n` +
+      `data: ${JSON.stringify({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "" },
+      })}\n\n`;
+    safeSend({ requestId, type: "stream_chunk", chunk: blockStart });
+
+    // 读取 OpenAI SSE 流并转换
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let finalUsage = null;
+    let stopReason = "end_turn";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (controller.signal.aborted) { reader.cancel(); break; }
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const payload = line.slice(6).trim();
+        if (payload === "[DONE]") continue;
+
+        let chunk;
+        try { chunk = JSON.parse(payload); } catch { continue; }
+
+        // 提取 usage（最后一个 chunk）
+        if (chunk.usage) {
+          finalUsage = chunk.usage;
+        }
+
+        const delta = chunk.choices?.[0]?.delta;
+        const finishReason = chunk.choices?.[0]?.finish_reason;
+
+        if (finishReason) {
+          stopReason = finishReason === "stop" ? "end_turn"
+            : finishReason === "length" ? "max_tokens"
+            : "end_turn";
+        }
+
+        if (delta?.content) {
+          const deltaEvent =
+            `event: content_block_delta\n` +
+            `data: ${JSON.stringify({
+              type: "content_block_delta",
+              index: 0,
+              delta: { type: "text_delta", text: delta.content },
+            })}\n\n`;
+          if (!safeSend({ requestId, type: "stream_chunk", chunk: deltaEvent })) {
+            controller.abort();
+            reader.cancel();
+            throw new Error("WebSocket disconnected during streaming");
+          }
+        }
+      }
+    }
+
+    if (!controller.signal.aborted) {
+      // content_block_stop
+      const blockStop =
+        `event: content_block_stop\n` +
+        `data: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`;
+      safeSend({ requestId, type: "stream_chunk", chunk: blockStop });
+
+      // message_delta (stop_reason + usage)
+      const msgDelta =
+        `event: message_delta\n` +
+        `data: ${JSON.stringify({
+          type: "message_delta",
+          delta: { stop_reason: stopReason, stop_sequence: null },
+          usage: { output_tokens: finalUsage?.completion_tokens || 0 },
+        })}\n\n`;
+      safeSend({ requestId, type: "stream_chunk", chunk: msgDelta });
+
+      // message_stop
+      const msgStop =
+        `event: message_stop\n` +
+        `data: ${JSON.stringify({ type: "message_stop" })}\n\n`;
+      safeSend({ requestId, type: "stream_chunk", chunk: msgStop });
+
+      safeSend({ requestId, type: "stream_end" });
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ── 降级调度 ─────────────────────────────────────────────────────────────
+
+const hasAnthropic = !!(ANTHROPIC_BASE_URL && ANTHROPIC_API_KEY);
+const hasOpenAI = !!(OPENAI_BASE_URL && OPENAI_API_KEY);
+
+/** 非流式：先 Anthropic，失败降级 OpenAI */
+async function forwardWithFallback(body, controller) {
+  if (hasAnthropic) {
+    try {
+      return await forwardToAnthropic(body, controller);
+    } catch (err) {
+      if (controller.signal.aborted) throw err;
+      if (hasOpenAI) {
+        log(`Anthropic 失败 (${err.message})，降级到 OpenAI`);
+      } else {
+        throw err;
+      }
+    }
+  }
+  if (hasOpenAI) {
+    return await forwardToOpenAI(body, controller);
+  }
+  throw new Error("无可用的上游 API");
+}
+
+/** 流式：先 Anthropic，失败降级 OpenAI */
+async function forwardStreamWithFallback(requestId, body, controller) {
+  if (hasAnthropic) {
+    try {
+      return await forwardToAnthropicStream(requestId, body, controller);
+    } catch (err) {
+      if (controller.signal.aborted) throw err;
+      if (hasOpenAI) {
+        log(`Anthropic 流式失败 (${err.message})，降级到 OpenAI`);
+      } else {
+        throw err;
+      }
+    }
+  }
+  if (hasOpenAI) {
+    return await forwardToOpenAIStream(requestId, body, controller);
+  }
+  throw new Error("无可用的上游 API");
+}
+
+// ── OpenAI 直接透传（/v1/models, /v1/chat/completions, /v1/responses）────
+
+/** 非流式透传到 OpenAI，原样返回响应 */
+async function forwardToOpenAIPassthrough(path, method, body, controller) {
+  if (!hasOpenAI) throw new Error("OPENAI_BASE_URL/OPENAI_API_KEY 未配置");
+
+  const apiUrl = `${OPENAI_BASE_URL}${path}`;
+  const timeout = setTimeout(() => controller.abort(), 120000);
+
+  try {
+    const options = {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+      signal: controller.signal,
+    };
+    if (body && method !== "GET") {
+      options.body = typeof body === "string" ? body : JSON.stringify(body);
+    }
+
+    const res = await fetch(apiUrl, options);
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(`OpenAI API ${res.status}: ${JSON.stringify(data)}`);
+    }
+    return data;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** 流式透传到 OpenAI，原样转发 SSE 块 */
+async function forwardToOpenAIPassthroughStream(requestId, path, body, controller) {
+  if (!hasOpenAI) throw new Error("OPENAI_BASE_URL/OPENAI_API_KEY 未配置");
+
+  let parsed = typeof body === "string" ? JSON.parse(body) : body;
+  parsed.stream = true;
+  const apiUrl = `${OPENAI_BASE_URL}${path}`;
+
+  const timeout = setTimeout(() => controller.abort(), 300000);
+  try {
+    const res = await fetch(apiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify(parsed),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const errorText = await res.text();
+      throw new Error(`OpenAI API ${res.status}: ${errorText}`);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (controller.signal.aborted) { reader.cancel(); break; }
+
+      const chunk = decoder.decode(value, { stream: true });
+      if (!safeSend({ requestId, type: "stream_chunk", chunk })) {
+        controller.abort();
+        reader.cancel();
+        throw new Error("WebSocket disconnected during streaming");
+      }
+    }
+
+    if (!controller.signal.aborted) {
+      safeSend({ requestId, type: "stream_end" });
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function cleanup() {
   clearInterval(heartbeatTimer);
   heartbeatTimer = null;
@@ -332,6 +731,8 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 log("=== API Client 启动 ===");
 log(`  Bridge:    ${BRIDGE_URL}`);
 log(`  Client ID: ${BRIDGE_ID}`);
+log(`  Anthropic: ${ANTHROPIC_BASE_URL || "(未配置)"}`);
+log(`  OpenAI:    ${OPENAI_BASE_URL || "(未配置)"}`);
 log(`  日志目录:  ${LOG_DIR}`);
 log(`  Node版本:  ${process.version}`);
 connect();

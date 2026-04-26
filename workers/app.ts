@@ -37,23 +37,21 @@ export default {
       return stub.fetch(request);   // 直接交给 Durable Object 处理
     }    
 
-    // GET /v1/models - return available models list
-    if (url.pathname === "/v1/models" && request.method === "GET") {
-      return Response.json({
-        object: "list",
-        data: [
-          {
-            id: "claude-opus-4-6",
-            object: "model",
-            created: 1700000000,
-            owned_by: "anthropic",
-          },
-        ],
-      });
-    }
+    // ── /v1/* API 端点 → 统一走 WebSocket Bridge ───────────────────────────
 
-    // POST /v1/messages - 转发到下游容器via WebSocket Bridge
-    if (url.pathname === "/v1/messages" && request.method === "POST") {
+    // 需要 API Key 验证的 /v1/* 端点
+    const v1Endpoints = [
+      { path: "/v1/models", method: "GET" },
+      { path: "/v1/messages", method: "POST" },
+      { path: "/v1/chat/completions", method: "POST" },
+      { path: "/v1/responses", method: "POST" },
+    ];
+
+    const matchedV1 = v1Endpoints.find(
+      (e) => url.pathname === e.path && request.method === e.method,
+    );
+
+    if (matchedV1) {
       // 验证 API Key
       const apiKey = request.headers.get("x-api-key") || request.headers.get("authorization")?.replace("Bearer ", "");
       if (!apiKey) {
